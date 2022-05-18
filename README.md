@@ -1,5 +1,5 @@
 # IOS-projects
-## 2021/2022 IOS projekt
+2021/2022 IOS projekty
 
 <img src="./other/images/FIT_zkratka_barevne_RGB_CZ.png" width="200">
 
