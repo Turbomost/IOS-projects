@@ -1,0 +1,647 @@
+#
+# @Author:  Václav Valenta (xvalen29)
+# @Date:    2022-03-17 14:28:17
+# @Last Modified by:   Václav Valenta (xvalen29)
+# @Last Modified time: 2022-04-01 16:00:02
+#
+
+#!/bin/bash
+export POSIXLY_CORRECT=yes
+export LC_NUMERIC=en_US.UTF-8
+
+# Errors enumeration
+ERR_INV_DATE=1
+ERR_INV_GEN=2
+ERR_INV_FLAG=3
+ERR_MULTI_DATE=4
+ERR_MULTI_GEN=5
+ERR_MULTI_WIDTH=6
+ERR_MULTI_COMM=7
+ERR_NO_DATE=8
+ERR_FILE=9
+
+# Vars for filters and commands
+AFTER=""
+BEFORE=""
+WIDTH=0
+GENDER=""
+COMMAND=0
+COMMAND_FLAG=""
+EVAL_DEBUG=""
+FILES=""
+FILES_COUNT=0
+FILTERS="1"
+FILTERS_COUNT=0
+
+# Constant strings
+HEAD="id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+VALID="((\$2 !~ /^[[:space:]]*([0-9]{4}-((0[13578]|1[02])-(0[1-9]|[12][0-9]|3[01])|(0[469]|11)-(0[1-9]|[12][0-9]|3[0])|02-(0[1-9]|1[0-9]|2[0-8]))|((18|19|20)(04|08|[2468][048]|[13579][26]|)|2000)-02-29)[[:space:]]*$/) && (\$2 !~ /^[[:space:]]*$/)) {
+                errs=errs\"Invalid date: \"\$0\"\n\";
+            }
+            else if ((\$3 !~ /^[[:space:]]*[0-9]+[[:space:]]*$/) && (\$3 !~ /^[[:space:]]*$/)) {
+                errs=errs\"Invalid age: \"\$0\"\n\";
+            }
+            else"
+HISTOGRAM=" while (i>=W){
+                printf(\"#\");
+                i-=W;
+            }
+            printf(\"\n\");"
+
+# Prints help
+printHelp() {
+    echo "Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+}
+
+# Load flags and check their values
+get_arguments() {
+    while :; do
+        case "$1" in
+
+        # Help
+        -h)
+            print_help
+            exit 0
+            ;;
+
+        # After, Before
+        -a | -b)
+            if [ "$1" == "-a" ]; then
+                DATE_FLAG="$AFTER"
+            else
+                DATE_FLAG="$BEFORE"
+            fi
+
+            if [ "$DATE_FLAG" == "" ]; then
+                if [ -z "$2" ]; then
+                    echo "No date inserted" >&2
+                    exit "$ERR_NO_DATE"
+                else
+                    if [ "$(date -d "$2" +%Y-%m-%d 2>/dev/null)" == "$2" ]; then
+                        if [ "$1" == "-a" ]; then
+                            AFTER="$2"
+                        else
+                            BEFORE="$2"
+                        fi
+                        shift
+                    else
+                        echo "Invalid date format $2" >&2
+                        exit "$ERR_INV_DATE"
+                    fi
+                fi
+            else
+                echo "More than one $1 flag" >&2
+                exit "$ERR_MULTI_DATE"
+            fi
+            ;;
+
+        # Gender
+        -g)
+            if [ "$GENDER" == "" ]; then
+                if [ "$2" == "M" ] || [ "$2" == "Z" ]; then
+                    GENDER=$2
+                    shift
+                else
+                    echo "Gender flag can only be M or Z" >&2
+                    exit "$ERR_INV_GEN"
+                fi
+            else
+                echo "More than one -g flag" >&2
+                exit "$ERR_MULTI_GEN"
+            fi
+            ;;
+
+        # Width
+        -s)
+            if [ "$WIDTH" == 0 ]; then
+                if [ -z "$2" ]; then
+                    WIDTH=-1
+                else
+                    if [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                        WIDTH=$2
+                        shift
+                    else
+                        WIDTH=-1
+                    fi
+                fi
+            else
+                echo "More than one -s flag" >&2
+                exit "$ERR_MULTI_WIDTH"
+            fi
+            ;;
+
+        # Commands
+        infected | merge | gender | age | daily | monthly | yearly | countries | districts | regions)
+            if [ "$COMMAND" == 0 ]; then
+                COMMAND_FLAG=$1
+                COMMAND=1
+            else
+                echo "Too many commands" >&2
+                exit "$ERR_MULTI_COMM"
+            fi
+            ;;
+
+        # Store files in the following format:
+        # "(cat/gz -dc/... FILE1)"
+        # "(cat FILE1) && (cat FILE2 | tail -n +2)"
+        # "(cat FILE1) && (cat FILE2 | tail -n +2) && ..."
+        *.bz2 | *.gz | *.csv)
+            if [[ "$1" == *.bz2 ]]; then
+                FORMAT="bzip2 -dc"
+            elif [[ "$1" == *.gz ]]; then
+                FORMAT="gzip -dc"
+            else
+                FORMAT="cat"
+            fi
+
+            if [ ! -r $1 ]; then
+                echo "File does not exists" >&2
+                exit "$ERR_FILE"
+            fi
+
+            if [ "$FILES_COUNT" -gt 0 ]; then
+                FILES+=" && ($FORMAT $1 | tail -n +2)"
+            else
+                FILES+="($FORMAT $1)"
+            fi
+            FILES_COUNT=$((FILES_COUNT + 1))
+            ;;
+
+        # Other
+        *)
+            # No args left
+            if [ -z "$1" ]; then
+                break
+
+            # Invalid flag
+            else
+                echo "Invalid flag $1" >&2
+                exit "$ERR_INV_FLAG"
+            fi
+            ;;
+
+        esac
+        shift
+    done
+
+    # Default command
+    if [ "$COMMAND_FLAG" == "" ]; then
+        COMMAND_FLAG="merge"
+    fi
+}
+
+# Concatenate files and remove empty lines
+get_files() {
+    if [ "$FILES_COUNT" -gt 1 ]; then
+        FILES="($FILES)"
+    fi
+    if [ "$FILES_COUNT" -gt 0 ]; then
+        FILES="$FILES |"
+    fi
+    FILES="$FILES sed '/^\s*$/d'"
+}
+
+# Set all filters in one string
+set_filters() {
+
+    # Date filter
+    if [ "$AFTER" != "" ] && [ "$BEFORE" != "" ]; then
+        FILTERS="(\$2 >= \"$AFTER\") && (\$2 <= \"$BEFORE\")"
+    elif [ "$AFTER" != "" ]; then
+        FILTERS="\$2 >= \"$AFTER\""
+    elif [ "$BEFORE" != "" ]; then
+        FILTERS="\$2 <= \"$BEFORE\""
+    fi
+
+    # Gender filter
+    if [ "$GENDER" != "" ]; then
+        if [ FILTERS != "1" ]; then
+            FILTERS="($FILTERS) && (\$4 == \"$GENDER\")"
+        else
+            FILTERS="\$4 == \"$GENDER\""
+        fi
+    fi
+
+    # Check for NULL columns
+    if [ "$FILTERS" != "1" ]; then
+        FILTERS="($FILTERS) && (\$2 !~ /^[[:space:]]*$/)"
+    fi
+}
+
+# Run command
+run_command() {
+    
+    # Infected
+    if [ "$COMMAND_FLAG" == "infected" ]; then
+        eval "$FILES | sed 's/ //g' | tail -n +2 |awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                    n++;
+                }
+            }
+        } END {
+            printf(\"%d\n\", n);
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Merge
+    elif [ "$COMMAND_FLAG" == "merge" ]; then
+        echo "$HEAD"
+        eval "$FILES | tail -n +2 | sed 's/ //g' | awk '{ gsub(/ /,\"\"); print }' | awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                    print \$0;
+                }
+            }
+        } END {
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Gender
+    elif [ "$COMMAND_FLAG" == "gender" ]; then
+        eval "$FILES | tail -n +2 | sed 's/ //g' | awk '{ gsub(/ /,\"\"); print }' | awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                    if (\$4 ~ /^[[:space:]]*Z[[:space:]]*$/) {
+                        Z++;
+                    } else if (\$4 ~ /^[[:space:]]*M[[:space:]]*$/) { 
+                        M++;
+                    }
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=100000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = M;
+                if (Z>max){max=Z;}
+                W=int(max/$WIDTH);
+            }
+
+
+            if (W == 0){
+                printf(\"M: %i\nZ: %i\n\", M, Z);
+            }
+            else{
+                printf(\"M: \");
+                i=M;
+                $HISTOGRAM
+                printf(\"Z: \");
+                i=Z;
+                $HISTOGRAM
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Age
+    elif [ "$COMMAND_FLAG" == "age" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            if (\$3 ~ /^[[:space:]]*[0-9]+[[:space:]]*$/){
+                if ($FILTERS){
+                    if ((int(\$3 / 10) >= 11) || ((int(\$3 / 10) == 10) && (\$3 % 10 > 5))) {
+                        array[11]++;
+                    } else {
+                        if(\$3 % 10 > 5) {
+                            array[int(\$3 / 10)+1]++;
+                        }
+                        else{
+                            array[int(\$3 / 10)]++;
+                        }
+                    }
+                }
+            }
+            else if (\$3 ~ /^[[:space:]]*$/){
+                if ($FILTERS){
+                    array[12]++;
+                }
+            }
+            else{
+                errs=errs\"Invalid age: \"\$0\"\n\";
+            }
+        } END {
+            if ($WIDTH == -1){W=10000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                for (x=0; x <= 12; x++){
+                    if (array[x]>max){
+                        max=array[x];
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            age_array[0]=\"0-5   \";age_array[1]=\"6-15  \";age_array[2]=\"16-25 \";age_array[3]=\"26-35 \";age_array[4]=\"36-45 \";
+            age_array[5]=\"46-55 \";age_array[6]=\"56-65 \";age_array[7]=\"66-75 \";age_array[8]=\"76-85 \";age_array[9]=\"86-95 \";
+            age_array[10]=\"96-105\";age_array[11]=\">105  \";age_array[12]=\"None  \";
+            for (x=0; x <= 12; x++){
+                printf(\"%s: \",age_array[x]);
+                if (W == 0){
+                    printf(\"%d\n\", array[x]);
+                }
+                else{
+                    i=array[x];
+                    $HISTOGRAM
+                }
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Daily
+    elif [ "$COMMAND_FLAG" == "daily" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                split(\$2, date_array, \"-\");
+                array[int(date_array[1])*366 + int(date_array[2])*31 + int(date_array[3])]++;
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=500;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (y=0; y < 2023; y++){
+                    for (m=1; m <= 12; m++){
+                        for (d=1; d <= 31; d++){
+                            if (array[y*366 + m*31 + d]>max){
+                                max=array[y*366 + m*31 + d];
+                            }
+                        }
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (y=0; y < 2023; y++){
+                for (m=1; m <= 12; m++){
+                    for (d=1; d <= 31; d++){
+                        if (array[y*366 + m*31 + d] > 0){
+                            if (y < 1000)   {Y=\"0\"y;} else {Y=y;}
+                            if (y < 100)    {Y=\"0\"y;} else {Y=y;}
+                            if (y < 10)     {Y=\"0\"y;} else {Y=y;}
+                            if (m < 10)     {M=\"0\"m;} else {M=m;}
+                            if (d < 10)     {D=\"0\"d;} else {D=d;}
+                            
+                            printf(\"%s-%s-%s: \", Y, M, D);
+                            if (W == 0){
+                                printf(\"%d\n\", array[y*366 + m*31 + d]);
+                            }
+                            else{
+                                i=array[y*366 + m*31 + d];
+                                $HISTOGRAM
+                            }
+                        }
+                    }
+                }
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Monthly
+    elif [ "$COMMAND_FLAG" == "monthly" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                split(\$2, date_array, \"-\");
+                array[int(date_array[1])*12 + int(date_array[2])]++;
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=10000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (y=0; y < 2023; y++){
+                    for (m=1; m <= 12; m++){
+                        if (array[y*12 + m]>max){
+                            max=array[y*12 + m];
+                        }
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (y=0; y < 2023; y++){
+                for (m=1; m <= 12; m++){
+                    if (array[y*12 + m] > 0){
+                        if (y < 1000)   {Y=\"0\"y;} else {Y=y;}
+                        if (y < 100)    {Y=\"0\"y;} else {Y=y;}
+                        if (y < 10)     {Y=\"0\"y;} else {Y=y;}
+                        if (m < 10)     {M=\"0\"m;} else {M=m;}
+
+                        printf(\"%s-%s: \", Y, M);
+                        if (W == 0){
+                            printf(\"%d\n\", array[y*12 + m]);
+                        }
+                        else{
+                            i=array[y*12 + m];
+                            $HISTOGRAM
+                        }
+
+                    }
+                }
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Yearly
+    elif [ "$COMMAND_FLAG" == "yearly" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            if $VALID {
+                if ($FILTERS){
+                split(\$2, date_array, \"-\");
+                array[int(date_array[1])]++;
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=100000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (y=0; y < 2023; y++){
+                    if (array[y]>max){
+                        max=array[y];
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (y=0; y < 2023; y++){
+                if (array[y] > 0){
+                    if (y < 1000)   {Y=\"0\"y;} else {Y=y;}
+                    if (y < 100)    {Y=\"0\"y;} else {Y=y;}
+                    if (y < 10)     {Y=\"0\"y;} else {Y=y;}
+
+                    printf(\"%s: \", Y);
+                    if (W == 0){
+                        printf(\"%d\n\", array[y]);
+                    }
+                    else{
+                        i=array[y];
+                        $HISTOGRAM
+                    }
+                }
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    # Countries
+    elif [ "$COMMAND_FLAG" == "countries" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            convert=\"ABCDEFGHIJKLMNOPQRSTUVWXYZ\";
+            if $VALID {
+                if ($FILTERS){
+                    if (\$8 !~ /^[[:space:]]*$/){
+                        array[index(convert,substr(\$8,1,1))*26 + index(convert,substr(\$8,2,1))]++;
+                        if (index(convert,substr(\$8,1,1))*26 + index(convert,substr(\$8,2,1)) == 27){
+                            print \$0;
+                        }
+                    }
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=100;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (y=1; y < 27; y++){
+                    for (x=1; x < 27; x++){
+                        if (array[y*26 + x] > max){
+                            max=array[y*26 + x];
+                        }
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (y=1; y < 27; y++){
+                for (x=1; x < 27; x++){
+                    if (array[y*26 + x] > 0){
+                        if (y*26+x != 3*26+26){
+                            printf(\"%c%c: \", substr(convert,y,1), substr(convert,x,1));
+                            if (W == 0){
+                                printf(\"%d\n\", array[y*26 + x]);
+                            }
+                            else{
+                                i=array[y*26 + x];
+                                $HISTOGRAM
+                            }
+                        }
+                    }
+                }
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+    
+    # Districts 
+    elif [ "$COMMAND_FLAG" == "districts" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            convert=\"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\";
+            if $VALID {
+                if ($FILTERS){
+                    if (\$6 ~ /^[[:space:]]*$/){
+                        array[0]++;
+                    }
+                    else{
+                        array[index(convert,substr(\$6,3,1))*40*40*40 + index(convert,substr(\$6,4,1))*40*40+index(convert,substr(\$6,5,1))*40 + index(convert,substr(\$6,6,1))]++;
+                    }
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=1000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (x=1; x < 41; x++){
+                    for (y=1; y < 41; y++){
+                        for (z=1; z < 41; z++){
+                            for (a=1; a < 41; a++){
+                                if (array[x*40*40*40+y*40*40+z*40+a] > max){
+                                    max=array[x*40*40*40+y*40*40+z*40+a];
+                                }
+                            }
+                        }
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (x=1; x < 41; x++){
+                for (y=1; y < 41; y++){
+                    for (z=1; z < 41; z++){
+                        for (a=1; a < 41; a++){
+                            if (array[x*40*40*40+y*40*40+z*40+a] > 0){
+                                printf(\"CZ%s%s%s%s: \", substr(convert,x,1), substr(convert,y,1), substr(convert,z,1), substr(convert,a,1));
+                                if (W == 0){
+                                    printf(\"%d\n\", array[x*40*40*40+y*40*40+z*40+a]);
+                                }
+                                else{
+                                    i=array[x*40*40*40+y*40*40+z*40+a];
+                                    $HISTOGRAM
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            printf(\"None: \");
+            if (W == 0){
+                printf(\"%d\n\", array[0]);
+            }
+            else{
+                i=array[0];
+                $HISTOGRAM
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    elif [ "$COMMAND_FLAG" == "regions" ]; then
+        eval "$FILES | tail -n +2 | awk -F ',' '{
+            convert=\"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\";
+            if $VALID {
+                if ($FILTERS){
+                    if (\$5 ~ /^[[:space:]]*$/){
+                        array[0]++;
+                    }
+                    else{
+                        array[index(convert,substr(\$5,3,1))*40*40 + index(convert,substr(\$5,4,1))*40+index(convert,substr(\$5,5,1))]++;
+                    }
+                }
+            }
+        } END {
+            if ($WIDTH == -1){W=10000;}
+            if($WIDTH !=0 && $WIDTH != -1){
+                max = 0;
+                for (x=1; x < 41; x++){
+                    for (y=1; y < 41; y++){
+                        for (z=1; z < 41; z++){
+                            if (array[x*40*40+y*40+z] > max){
+                                max=array[x*40*40+y*40+z];
+                            }
+                        }
+                    }
+                }
+                W=int(max/$WIDTH);
+            }
+            for (x=1; x < 41; x++){
+                for (y=1; y < 41; y++){
+                    for (z=1; z < 41; z++){
+                        if (array[x*40*40+y*40+z] > 0){
+                            printf(\"CZ%s%s%s: \", substr(convert,x,1), substr(convert,y,1), substr(convert,z,1));
+                            if (W == 0){
+                                printf(\"%d\n\", array[x*40*40+y*40+z]);
+                            }
+                            else{
+                                i=array[x*40*40+y*40+z];
+                                $HISTOGRAM
+                            }
+                        }
+                    }
+                }
+            }
+            printf(\"None: \");
+            if (W == 0){
+                printf(\"%d\n\", array[0]);
+            }
+            else{
+                i=array[0];
+                $HISTOGRAM
+            }
+            printf errs > \"/dev/stderr\";
+        }'"
+
+    fi
+}
+
+# Main function
+get_arguments "$@"
+get_files
+set_filters
+run_command
